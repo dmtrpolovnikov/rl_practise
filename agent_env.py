@@ -100,13 +100,15 @@ class OU_env:
                  random_state : int   = 0, 
                  states : np.ndarray  = None,
                  sma_window : int     = 50,
-                 pnl_step : int       = 2
+                 pnl_step : int       = 2,
+                 risk_avertive : bool = True
                 ):
         '''
             initialize environment with provided prices trace or generate a random new
             then create states sequence as a feed for RL-agent with rewards for actions input
         '''
         
+        self.risk_avertive = risk_avertive  # to define state format
         self.random_state  = random_state   # to make available a repetition
         self.sma_window    = sma_window     # defines sma for algorithmic strategy
         
@@ -127,7 +129,7 @@ class OU_env:
         self.states['up_bb']     = self.states['sma'] + 2 * self.states['std']
         self.states['down_bb']   = self.states['sma'] - 2 * self.states['std']
         
-        self.states['state']     = ( (self.states['price'] - self.states['sma']) / self.states['std'] ).round(0)
+        self.states['state']     = ( (self.states['price'] - self.states['sma']) / self.states['std'] ).fillna(0).astype(int)
         self.states['position']  = 0
         
         self.step_number    = self.sma_window - 1   # indexer for pd.dataframe
@@ -135,7 +137,7 @@ class OU_env:
         
         # usable for RL parameters
         self.done           = False
-        self.state          = self.states['state'][self.step_number].astype(int)
+        self.state          = self.states['state'][self.step_number]
         self.action_space   = {'open_long' : 0, 'close_long' : 1, 'open_short' : 2, 'close_short' : 3}
         self.action_n       = len(self.action_space) 
         self.state_space    = np.arange(-4, 5, 1)
@@ -157,7 +159,7 @@ class OU_env:
             self.states['std']       = self.states['price'].rolling(window=self.sma_window).std()
             self.states['up_bb']     = self.states['sma'] + 2 * self.states['std']
             self.states['down_bb']   = self.states['sma'] - 2 * self.states['std']
-            self.states['state']     = ( (self.states['price'] - self.states['sma']) / self.states['std'] ).round(0)
+            self.states['state']     = ( (self.states['price'] - self.states['sma']) / self.states['std'] ).fillna(0).astype(int)
             self.states['position']  = 0
             
         else:
@@ -165,7 +167,11 @@ class OU_env:
             self.done                = False
             self.state               = self.states['state'][self.step_number].astype(int)
             self.states['position']  = 0
-        return self.state, self.done
+            
+        if self.risk_avertive:
+            return (self.state, self.states['position'][self.step_number]), self.done
+        else:          
+            return self.state, self.done
     
     def step(self, action):
         '''
@@ -173,20 +179,30 @@ class OU_env:
             according to input action calculate and return 
             state, reward, done, info (='info')
         '''
-        self.step_number += 1
+        if self.step_number >= (len(self.states) - 1 - self.pnl_step) :
+            self.done = True
+            self.state = 0
+            reward = 0
+            info   = 'info'
         
         # since we define reward (pnl) via close_i+pnl_step, subtract pnl_step from the last step
-        if ( self.step_number < len(self.states) - 1 - self.pnl_step):
+        else :
+            self.step_number += 1
             info   = 'info'
-            self.state = self.states['state'][self.step_number].astype(int)
+            self.state = self.states['state'][self.step_number]
             
             # OK, let reward to be the next eq: r_i = sign(action) * ( close_(i+-pnl_step) - close_i ) / close_i
             
             # %2 == 0 means we open position !
             if (self.action_space.get(action) % 2) == 0:
                 
-                # set new position
-                self.states.loc[self.step_number, 'position'] = 1 - self.action_space.get(action)
+                if ( self.states.loc[self.step_number - 1, 'position'] * (1 - self.action_space.get(action)) ) < 0 :
+                    # change position
+                    self.states.loc[self.step_number, 'position'] = 1 - self.action_space.get(action)
+                else:
+                    # increase position
+                    self.states.loc[self.step_number, 'position'] =\
+                        self.states.loc[self.step_number - 1, 'position'] + 1 - self.action_space.get(action)
                 
                 # additional multiplier to encourage the agent to open position when there's a large deviation
                 multiplier = abs(self.states['state'][self.step_number]) + 1
@@ -194,7 +210,6 @@ class OU_env:
                 # don't forget to correct signum according to provided action! (short = -1, long +1)
                 reward = (self.states['price'][self.step_number + self.pnl_step] - self.states['price'][self.step_number])\
                             / self.states['price'][self.step_number] * self.states['position'][self.step_number] * multiplier
-                
                 
             # close position => define reward as : sign(action) * ( close_(i) - close_(i-pnl_step) ) / close_(i-pnl_step)
             else:
@@ -207,16 +222,14 @@ class OU_env:
                 
                 # don't forget to correct signum according to provided action! (short = -1, long +1)
                 reward = (self.states['price'][self.step_number] - self.states['price'][self.step_number - self.pnl_step])\
-                            / self.states['price'][self.step_number - self.pnl_step]\
-                            * self.states['position'][self.step_number] * multiplier
+                            / self.states['price'][self.step_number - self.pnl_step] * self.states['position'][self.step_number] * multiplier
 
+        if self.risk_avertive:
+            return (self.state, self.states['position'][self.step_number]), reward, self.done, info
         else:
-            self.done = True
-            self.state = 0
-            reward = 0
-            info   = 'info' 
-        return self.state, reward, self.done, info
-    
+            return self.state, reward, self.done, info
+        
+    # use positioned env trace to calc pnl
     def vector_backtest(self, cost_bps=0, render=True):
         # calculate trades as change in curr position
         trades = np.concatenate([[0], self.states['position'].diff()[1:]])
@@ -233,7 +246,6 @@ class OU_env:
         
         # market to market - result 
         m2m    = cash + self.states['position'] * self.states['price']
-        
         
         if render:
             plt.figure(figsize=(15,8))
@@ -290,19 +302,44 @@ class OU_env:
 #=============================================================================#
 # implement agent with q-values function
 class RL_agent:
-    def __init__(self, states, actions):
+    def __init__(self, states, actions, risk_avertive = True, max_pos : int = 1):
         '''
             initialize RL agent with possible environment states it acts to
             with possible actions to interact
             create q_function as a 2D-dict with states -> actions -> q_value 
         '''
-        self.actions    = actions
-        self.states     = states
-        self.q_function = {
-            state : {action : 0 
-                for action in self.actions}
-            for state in self.states
-        }
+        self.risk_avertive = risk_avertive
+        self.max_pos       = abs(max_pos)
+        self.actions       = actions
+        
+        if self.risk_avertive:
+            self.states        = [ (state, pos) for pos in np.arange(-max_pos, max_pos + 1)
+                                for state in states ]
+            self.q_function = {
+                    (state, pos) : { action : 0
+                        for action in self.actions}
+                    for pos in np.arange(-max_pos, max_pos + 1)
+                for state in states
+            }
+            
+            for state, pos in self.states:
+                for action in self.actions:
+                    if (pos <= -max_pos and abs(self.actions.get(action) - 1.5) > 1)\
+                        or (pos >= max_pos and abs(self.actions.get(action) - 1.5) < 1)\
+                        or (abs(pos) - max_pos == -1 and pos != 0)\
+                        or (pos == 0 and abs(self.actions.get(action) - 1) == 1):
+                            self.q_function[(state, pos)][action] = 0
+                    else:
+                        self.q_function[(state, pos)][action] = float('-inf')
+                    if (pos < 0 and action == 'close_long') or (pos > 0 and action == 'close_short'):
+                        self.q_function[(state, pos)][action] = float('-inf')
+        else:
+            self.states        = [ state for state in states ]
+            self.q_function = {
+                    state : { action : 0 for action in self.actions}
+                for state in states
+            }
+                    
         self.counter    = copy.deepcopy(self.q_function)
 
     def get_epsilon_greedy_action(self, q_values, epsilon : float):
@@ -310,10 +347,11 @@ class RL_agent:
             using epsilon greedy policy choose the best action according to q_function
             return action
         '''
-        policy = np.ones(len(self.actions)) * epsilon / len(self.actions)
+        valid_q_values = np.array(np.asarray(q_values) > -10 ** 10)
+        policy = np.ones(len(q_values)) * valid_q_values * epsilon / valid_q_values.sum()
         max_action = np.argmax(q_values)
         policy[max_action] += 1 - epsilon
-        return np.random.choice(self.actions, p=policy)
+        return np.random.choice(list(self.actions.keys()), p=policy)
 #=============================================================================#
 
 #=============================================================================#
@@ -742,7 +780,7 @@ class Dyna_Q:
         self.gamma          = gamma
         self.alpha          = alpha
         self.planning_n     = planning_n
-        self.model          = { state : { action : [0, 0]
+        self.model          = { state : { action : [0, state]
                                     for action in self.agent.actions }
                                 for state in self.agent.states }
         
@@ -779,8 +817,9 @@ class Dyna_Q:
                 for _ in range(self.planning_n):
                     
                     # take random sample of states and actions
-                    random_state  = np.random.choice(self.agent.states)
-                    random_action = np.random.choice(self.agent.actions)
+                    random_state  = self.agent.states[np.random.choice(np.arange(len(self.agent.states)))]
+                    random_action = np.random.choice(
+                        [act for act, val in self.agent.q_function[random_state].items() if val > -10 ** 10])
                     
                     # take modeled state, reward from model via sampled state, action
                     model_reward, model_state = self.model[random_state][random_action]
